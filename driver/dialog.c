@@ -169,6 +169,12 @@ struct window_state {
   int nmsgs;
   const auth_message *msgs;
 
+  /* PAM messages with no text field, shown without waiting for OK. */
+  auth_message *info_msgs;
+  char **info_strs;		/* Our copies of their text */
+  int n_info_msgs;
+  double info_time;		/* When they went up */
+
   /* "Characters" in the password may be a variable number of bytes long.
      plaintext_passwd contains the raw bytes.
      plaintext_passwd_char_size indicates the size in bytes of each character,
@@ -1934,6 +1940,72 @@ window_draw (window_state *ws)
 }
 
 
+/* Messages that were replaced this quickly were never seen, so they get
+   carried along to the next dialog.  PAM replaces them within milliseconds
+   when it isn't waiting on anything; a fingerprint takes longer than this.
+ */
+#define INFO_SEEN_TIME 0.4
+
+static Bool
+info_unseen_p (window_state *ws)
+{
+  return (ws->n_info_msgs > 0 &&
+          double_time() - ws->info_time < INFO_SEEN_TIME);
+}
+
+static void
+free_info_msgs (window_state *ws)
+{
+  int i;
+  if (ws->msgs == ws->info_msgs)
+    {
+      ws->msgs  = 0;
+      ws->nmsgs = 0;
+    }
+  for (i = 0; i < ws->n_info_msgs; i++)
+    free (ws->info_strs[i]);
+  if (ws->info_msgs) free (ws->info_msgs);
+  if (ws->info_strs) free (ws->info_strs);
+  ws->info_msgs = 0;
+  ws->info_strs = 0;
+  ws->n_info_msgs = 0;
+}
+
+static void
+add_info_msg (window_state *ws, const auth_message *msg)
+{
+  const char *text = (msg->msg ? msg->msg : "");
+  int i, n;
+
+  /* Drop an older copy of the same text, e.g. "Place your finger". */
+  for (i = 0; i < ws->n_info_msgs; i++)
+    if (!strcmp (ws->info_strs[i], text))
+      {
+        free (ws->info_strs[i]);
+        for (; i < ws->n_info_msgs - 1; i++)
+          {
+            ws->info_strs[i] = ws->info_strs[i+1];
+            ws->info_msgs[i] = ws->info_msgs[i+1];
+          }
+        ws->n_info_msgs--;
+        break;
+      }
+
+  n = ws->n_info_msgs + 1;
+  ws->info_msgs = (auth_message *) realloc (ws->info_msgs,
+                                            n * sizeof(*ws->info_msgs));
+  ws->info_strs = (char **) realloc (ws->info_strs,
+                                     n * sizeof(*ws->info_strs));
+  if (!ws->info_msgs || !ws->info_strs) abort();
+
+  ws->info_strs[n-1] = strdup (text);
+  if (!ws->info_strs[n-1]) abort();
+  ws->info_msgs[n-1].type = msg->type;
+  ws->info_msgs[n-1].msg  = ws->info_strs[n-1];
+  ws->n_info_msgs = n;
+}
+
+
 /* Unmaps the window and frees window_state.
  */
 static void
@@ -1941,6 +2013,7 @@ destroy_window (window_state *ws)
 {
   XEvent event;
 
+  free_info_msgs (ws);
   memset (ws->plaintext_passwd, 0, sizeof(ws->plaintext_passwd));
   memset (ws->plaintext_passwd_char_size, 0,
           sizeof(ws->plaintext_passwd_char_size));
@@ -2686,6 +2759,32 @@ dialog_session (window_state *ws,
 window_state *global_ws = 0;
 
 
+/* Puts up messages that have no text field and returns without running
+   the event loop.  pam_fprintd sends "Place your finger" and then sits
+   waiting for the reader, so if we waited for OK here, the user would
+   have to tap the reader and then click.
+ */
+static void
+show_info_msgs (window_state *ws, int nmsgs, const auth_message *msgs)
+{
+  int i;
+
+  if (! info_unseen_p (ws))
+    free_info_msgs (ws);
+  for (i = 0; i < nmsgs; i++)
+    add_info_msg (ws, &msgs[i]);
+
+  ws->nmsgs = ws->n_info_msgs;
+  ws->msgs  = ws->info_msgs;
+  ws->start_time = double_time();
+  ws->end_time = ws->start_time + ws->passwd_timeout;
+  ws->unlock_button_state.disabled_p = True;  /* Not reading input yet */
+
+  window_draw (ws);
+  ws->info_time = double_time();
+}
+
+
 /* The authentication conversation function.
 
    Like a PAM conversation function, this accepts multiple messages in a
@@ -2695,6 +2794,11 @@ window_state *global_ws = 0;
    PAM might call this multiple times before authenticating.  We are unable
    to combine multiple messages onto a single dialog if PAM splits them
    between calls to this function.
+
+   If there are no text fields, the messages are put up and we return
+   right away, so that PAM can get on with whatever it is waiting for.
+   Messages that were only up for a moment are carried over to the next
+   dialog.
 
    Returns True on success.  If the user timed out or canceled, we just exit.
  */
@@ -2709,13 +2813,52 @@ xscreensaver_auth_conv (void *closure,
   int prev_msg = 0;
   int field_count = 0;
   auth_response *responses;
+  auth_response *pam_responses;
+  auth_message *all_msgs = 0;
+  int pam_nmsgs = nmsgs;
+  int ninfo = 0;
+  Bool prompt_p = False;
   window_state *ws = global_ws;
 
   if (!ws)
     ws = global_ws = window_init (root_widget, False);
 
-  responses = calloc (nmsgs, sizeof(*responses));
+  responses = pam_responses = calloc (nmsgs, sizeof(*responses));
   if (!responses) abort();
+
+  for (i = 0; i < nmsgs; i++)
+    if (msgs[i].type == AUTH_MSGTYPE_PROMPT_ECHO ||
+        msgs[i].type == AUTH_MSGTYPE_PROMPT_NOECHO)
+      prompt_p = True;
+
+  if (nmsgs > 0 && !prompt_p)
+    {
+      show_info_msgs (ws, nmsgs, msgs);
+      *resp = responses;
+      return True;
+    }
+
+  if (ws->n_info_msgs)
+    {
+      /* Throw away anything typed or clicked while PAM had us tied up,
+         lest a stray Enter submit an empty password. */
+      XSync (ws->dpy, True);
+
+      if (info_unseen_p (ws))
+        {
+          /* Put them above this batch, in the first dialog. */
+          ninfo = ws->n_info_msgs;
+          all_msgs  = calloc (ninfo + nmsgs, sizeof(*all_msgs));
+          responses = calloc (ninfo + nmsgs, sizeof(*responses));
+          if (!all_msgs || !responses) abort();
+          memcpy (all_msgs, ws->info_msgs, ninfo * sizeof(*all_msgs));
+          memcpy (all_msgs + ninfo, msgs, nmsgs * sizeof(*all_msgs));
+          msgs = all_msgs;
+          nmsgs += ninfo;
+        }
+      else
+        free_info_msgs (ws);
+    }
 
   for (i = 0; i < nmsgs; i++)
     {
@@ -2761,7 +2904,15 @@ xscreensaver_auth_conv (void *closure,
     exit (0);
     break;
   case AUTH_FINISHED:
-    *resp = responses;
+    if (ninfo)
+      {
+        memcpy (pam_responses, responses + ninfo,
+                pam_nmsgs * sizeof(*pam_responses));
+        free (responses);
+        free (all_msgs);
+        free_info_msgs (ws);
+      }
+    *resp = pam_responses;
     return True;
   default:
     abort();
@@ -2782,6 +2933,7 @@ xscreensaver_auth_finished (void *closure, Bool authenticated_p)
   int unlock_failures = 0;
   time_t failure_time = 0;
   Bool prompted_p = !!ws;
+  Bool info_p = False;
 
   /* If this was called without xscreensaver_auth_conv() ever having been
      called, then either PAM decided that the user is authenticated without
@@ -2790,6 +2942,19 @@ xscreensaver_auth_finished (void *closure, Bool authenticated_p)
    */
   if (!ws)
     ws = global_ws = window_init (root_widget, False);
+
+  /* If PAM said something on its way out, like a password expiration
+     warning, leave it up along with whatever we have to say. */
+  if (ws->n_info_msgs)
+    {
+      ws->unlock_button_state.disabled_p = False;
+      if (info_unseen_p (ws))
+        info_p = True;
+      else
+        free_info_msgs (ws);
+    }
+
+  *msg = 0;
 
   if (authenticated_p)
     {
@@ -2830,7 +2995,7 @@ xscreensaver_auth_finished (void *closure, Bool authenticated_p)
             fprintf (stderr, "%s: ignoring recent unlock failures:"
                      " %d within %d sec\n",
                      blurb(), unlock_failures, warning_slack);
-          goto END;
+          goto NOTIFY;
         }
       else if (days  > 1) sprintf (ago, _("%d days ago"), days);
       else if (hours > 1) sprintf (ago, _("%d hours ago"), hours);
@@ -2844,16 +3009,14 @@ xscreensaver_auth_finished (void *closure, Bool authenticated_p)
                  _("There have been %d failed login attempts, oldest %s."),
                  unlock_failures, ago);
     }
-  else
-    {
-      /* No need to pop up a window.  Authenticated, and there are no previous
-         failures to report.
-       */
-      goto END;
-    }
 
-  if (!*msg) abort();
-  ws->body_label = strdup (msg);
+ NOTIFY:
+  if (*msg)
+    ws->body_label = strdup (msg);
+  else if (!info_p)
+    /* No need to pop up a window.  Authenticated, and there are no previous
+       failures to report. */
+    goto END;
 
   ws->auth_state = AUTH_NOTIFY;
   gui_main_loop (ws, False, True);

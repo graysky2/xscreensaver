@@ -347,8 +347,8 @@ pam_conversation (int nmsgs,
     fprintf (stderr, ") ...\n");
 
   /* This opens the dialog box and runs the X11 event loop. 
-     It only returns if the user entered a password.
-     If they hit cancel, or timed out, it exited.
+     It only returns if the user entered a password, or if there was
+     nothing to enter.  If they hit cancel, or timed out, it exited.
   */
   conv_closure->conv_fn (conv_closure->conv_fn_closure, nmsgs, messages,
                          &authresp);

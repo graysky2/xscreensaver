@@ -34,7 +34,8 @@
  *               - First time it is called, it creates the window.
  *               - Subsequent times, it reuses that window.
  *               - Runs an X11 event loop waiting for the user to complete
- *                 or timeout, then returns the entered strings.
+ *                 or timeout, then returns the entered strings.  If there
+ *                 is nothing to enter, it just displays and returns.
  *           - pam_conv takes the user input and returns success/failure.
  *       - xscreensaver_auth_finished is called to pop up a final dialog to
  *         present any error messages.
